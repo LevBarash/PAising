@@ -1,5 +1,5 @@
 //
-// PAising version 1.11. This program employs standard spin coding.
+// PAising version 1.12. This program employs standard spin coding.
 // This program is introduced in the paper:
 // L.Yu. Barash, M. Weigel, M. Borovsky, W. Janke, L.N. Shchur, GPU accelerated population annealing algorithm
 // This program is licensed under a Creative Commons Attribution 4.0 International License:
@@ -93,6 +93,47 @@ static __inline__ __device__ double fetch_double(texture<int2,1> t, int i) // te
 	return __hiloint2double(v.y, v.x);
 }
 
+template <class sometype> __inline__ __device__ sometype smallblockReduceSum(sometype val) // use when blockDim.x < 32
+{											   // blockDim.x must be a power of 2
+	static __shared__ sometype shared[32];
+	shared[threadIdx.x] = val;
+	for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1){
+		__syncthreads(); if (threadIdx.x < stride)  shared[threadIdx.x] += shared[threadIdx.x+stride];
+	}
+	__syncthreads(); return shared[0];
+}
+
+#if  (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300)
+template <class sometype> __inline__ __device__ sometype warpReduceSum(sometype val)
+{
+	for (int offset = warpSize/2; offset > 0; offset /= 2) val += __shfl_down(val, offset);
+	return val;
+}
+
+template <class sometype> __inline__ __device__ sometype blockReduceSum(sometype val)	 // use when blockDim.x is divisible by 32
+{
+	static __shared__ sometype shared[32];			// one needs to additionally synchronize threads after execution
+	int lane = threadIdx.x % warpSize;			// in the case of multiple use of blockReduceSum in a single kernel
+	int wid = threadIdx.x / warpSize;
+	val = warpReduceSum(val);
+	if (lane==0) shared[wid]=val;
+	__syncthreads();
+	val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : 0;
+	if (wid==0) val = warpReduceSum(val);
+	return val;
+}
+#else
+template <class sometype> __inline__ __device__ sometype blockReduceSum(sometype val)	// blockDim.x must be a power of 2
+{
+	static __shared__ sometype shared[Nthreads];
+	shared[threadIdx.x] = val;
+	for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1){
+		__syncthreads(); if (threadIdx.x < stride)  shared[threadIdx.x] += shared[threadIdx.x+stride];
+	}
+	__syncthreads(); return shared[0];
+}
+#endif
+
 #if (__CUDACC_VER_MAJOR__ < 8) || ( defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600 )
 	__device__ double atomicAdd(double* address, double val) // allows to use atomicAdd operation for double precision floating point values
 	{ 
@@ -153,9 +194,8 @@ __global__ void checkKerALL(Replica* Rd, unsigned int sweeps, unsigned long long
 
 __global__ void energyKer(Replica* Rd) // calculation of energy and magnetization for each replica
 {
-	__shared__ int e[Nthreads], m[Nthreads];
 	signed char sA,sB,Ai2,Bi2,Ai4,Bi4; unsigned int idx, t = threadIdx.x, B = blockIdx.x, iL, iU; 
-	unsigned int tx, ty; int Energy = 0, Magnetization = 0;
+	unsigned int tx, ty; int e = 0, m = 0, Energy = 0, Magnetization = 0;
 	for (idx = t; idx < (N/2); idx += EQthreads){
 		if(t < EQthreads){
 			sA = Rd[B].gA[idx]; sB = Rd[B].gB[idx];
@@ -165,40 +205,29 @@ __global__ void energyKer(Replica* Rd) // calculation of energy and magnetizatio
 			if(ty&1){ Ai2 = sB; Bi2 = Rd[B].gA[iL];  }
 			else{     Ai2 = Rd[B].gB[iL];  Bi2 = sA; }
 			Ai4 = Rd[B].gB[iU]; Bi4 = Rd[B].gA[iU];
-			e[t] = - sA*(Ai2+Ai4) - sB*(Bi2+Bi4); m[t]= sA + sB;
-		} else e[t] = m[t] = 0;
-		for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1){
-			__syncthreads();
-			if (t < stride){
-				e[t] += e[t + stride];
-				m[t] += m[t + stride];
-			}
-		}
-		__syncthreads();
-		if (t == 0) { Energy += e[0]; Magnetization += m[0]; }
+			e = - sA*(Ai2+Ai4) - sB*(Bi2+Bi4); m = sA + sB;
+		} else e = m = 0;
+		e = blockReduceSum<int>(e); __syncthreads();
+		m = blockReduceSum<int>(m); __syncthreads();
+		if (t == 0) { Energy += e; Magnetization += m; }
 	}
 	if ( t == 0 ) { Rd[B].IE = Energy; Rd[B].M = Magnetization; }
 }
 
 __global__ void QKer(Replica* Rd, int R, double dB, double Emean, int CalcPart, double* Qd)  // calculation of partition function ratio
 {
-	__shared__ double factor[Nthreads];	// summation of exponential Boltzmann-like factors in deterministic order
+	double factor;				// summation of exponential Boltzmann-like factors in deterministic order
 	if(CalcPart == 0){                      // first part of the calculation
 		int t = threadIdx.x; int b = blockIdx.x; int idx = t + Nthreads * b;	
-		factor[t] = (idx < R) ? exp(-dB*(Rd[idx].IE-Emean)) : 0.0;
-		for (unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-			__syncthreads(); if (t < stride) factor[t] += factor[t + stride];
-		}
-		__syncthreads();
-		if(t == 0) Rd[idx].ParSum.ValDouble = factor[0]; // sum for all threads in current block is saved to global memory
+		factor = (idx < R) ? exp(-dB*(Rd[idx].IE-Emean)) : 0.0;
+		factor = blockReduceSum<double>(factor);
+		if(t == 0) Rd[idx].ParSum.ValDouble = factor; // sum for all threads in current block is saved to global memory
 	} else{					// second part of the calculation, summation of the partial sums
 		double MyParSum = 0; int j = 0, t = threadIdx.x;
 		for (j = 0; j < R; j+=Nthreads){
-			factor[t] = (t+j)*Nthreads < R ? Rd[(t+j)*Nthreads].ParSum.ValDouble : 0.0;
-			for(unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-				__syncthreads(); if (t < stride) factor[t] += factor[t+stride];
-			}
-			__syncthreads(); MyParSum += factor[0];
+			factor = (t+j)*Nthreads < R ? Rd[(t+j)*Nthreads].ParSum.ValDouble : 0.0;
+			factor = blockReduceSum<double>(factor); __syncthreads();
+			MyParSum += factor;
 		}       
 		if(t==0) *Qd = MyParSum;
 	}
@@ -206,7 +235,7 @@ __global__ void QKer(Replica* Rd, int R, double dB, double Emean, int CalcPart, 
 
 __global__ void CalcTauKer(Replica* Rd, int Rinit, int R, double lnQ, double dB, unsigned int* Rnew, unsigned long long rng_seed, unsigned long long initial_sequence) // calculation of numbers of copies for all replicas
 {
-	__shared__ unsigned int parS[Nthreads];
+	unsigned int parS;
 	int t = threadIdx.x; int b = blockIdx.x;	
 	int idx = t + Nthreads * b; double mu, mufloor;
 	RNGState localrng; curand_init(rng_seed,initial_sequence+idx,0,&localrng);
@@ -214,30 +243,25 @@ __global__ void CalcTauKer(Replica* Rd, int Rinit, int R, double lnQ, double dB,
 		mu = ((double)Rinit)/R*exp(-dB*(double)Rd[idx].IE - lnQ);
 		mufloor = floor(mu);
 		if(curand_uniform_double(&localrng) < (mu-mufloor))
-			parS[t] = Rd[idx].Roff = mufloor + 1;
-		else    parS[t] = Rd[idx].Roff = mufloor;	// number of copies 
-	} else parS[t] = 0;
-	for (unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-		__syncthreads();
-		if (t < stride) parS[t] += parS[t+stride];
+			parS = Rd[idx].Roff = mufloor + 1;
+		else    parS = Rd[idx].Roff = mufloor;	// number of copies 
+	} else parS = 0;
+	parS = blockReduceSum<unsigned int>(parS);
+	if(t==0){ 
+		Rd[idx].ParSum.ValInt[1] = parS;  // sum of Roff for all threads in current block
+		atomicAdd(Rnew,parS); // we save new population size
 	}
-	__syncthreads();
-	if(t==0) Rd[idx].ParSum.ValInt[1] = parS[0];  // sum of Roff for all threads in current block
-	else if(t==1) atomicAdd(Rnew,parS[0]); // we save new population size
 }
 
 __global__ void CalcParSum(Replica* Repd, int R) // calculation of {sum_{j=0}^i Roff} for each replica
 {
-	__shared__ unsigned int parS[Nthreads];
+	unsigned int parS; __shared__ unsigned int val;
 	int j, t = threadIdx.x, b = blockIdx.x;
 	int idx = t + Nthreads * b; unsigned int MyParSum = 0;
 	for (j = 0; j<b; j+=Nthreads){
-		parS[t] = (t+j<b) ? Repd[(t+j)*Nthreads].ParSum.ValInt[1] : 0;
-		for(unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-			__syncthreads();
-			if (t < stride) parS[t] += parS[t+stride];
-		}
-		__syncthreads(); MyParSum += parS[0]; // we sum Roff for all blocks from 0 to (b-1).
+		parS = (t+j<b) ? Repd[(t+j)*Nthreads].ParSum.ValInt[1] : 0;
+		parS = blockReduceSum<unsigned int>(parS); 
+		if(t==0) val = parS; __syncthreads(); MyParSum += val; // we sum Roff for all blocks from 0 to (b-1).
 	}
 	if(idx<R){
 		for(j=Nthreads*b;j<idx;j++) MyParSum+=Repd[j].Roff;	// we add Roff for current block threads from 0 to (t-1)
@@ -257,24 +281,14 @@ __global__ void resampleKer(Replica* Repd, Replica* Repdnew) // copying replicas
 
 __global__ void CalcAverages(Replica* Repd, int R, double* Averages) // calculation of observables via averaging over the population
 {
-	__shared__ double U[Nthreads], V[Nthreads];  // we use only 16 kilobytes of shared memory
-	int t = threadIdx.x, b = blockIdx.x; int idx = t + Nthreads * b; double currE,currM,currM2;
+	int t = threadIdx.x, b = blockIdx.x; int idx = t + Nthreads * b; double currE,currE2,currM,currM2,currM4;
 	if(idx<R){ currE = Repd[idx].IE; currM = Repd[idx].M; if(currM<0) currM=-currM;} else{ currE = 0; currM = 0;}
-	currM2=currM*currM; U[t] = currE; V[t] = currE*currE;
-	for (unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-		__syncthreads(); if (t < stride) { U[t] += U[t+stride]; V[t] += V[t+stride];}
-	}
-	if(t==0) {atomicAdd(&Averages[0], U[0]); atomicAdd(&Averages[1], V[0]);}
-	U[t] = currM; V[t] = currM2;
-	for (unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-		__syncthreads(); if (t < stride) { U[t] += U[t+stride]; V[t] += V[t+stride];}
-	}
-	if(t==0) {atomicAdd(&Averages[2], U[0]); atomicAdd(&Averages[3], V[0]);}
-	U[t] = currM2*currM2;
-	for (unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-		__syncthreads(); if (t < stride) U[t] += U[t+stride];
-	}
-	if(t==0) atomicAdd(&Averages[4], U[0]);
+	currE2 = currE*currE; currM2 = currM*currM; currM4 = currM2*currM2;
+	currE  = blockReduceSum<double>(currE);	 if(t==0) atomicAdd(&Averages[0], currE);  __syncthreads();
+	currE2 = blockReduceSum<double>(currE2); if(t==0) atomicAdd(&Averages[1], currE2); __syncthreads();
+	currM  = blockReduceSum<double>(currM);	 if(t==0) atomicAdd(&Averages[2], currM);  __syncthreads();
+	currM2 = blockReduceSum<double>(currM2); if(t==0) atomicAdd(&Averages[3], currM2); __syncthreads();
+	currM4 = blockReduceSum<double>(currM4); if(t==0) atomicAdd(&Averages[4], currM4);
 }
 
 #ifdef MHR
@@ -293,15 +307,11 @@ __global__ void UpdateShistE(Replica* Repd, int R, int* ShistE) // adding energy
 
 __global__ void HistogramOverlap(Replica* Repd, int Rinit, int R, double lnQ, double dB, double* overlap) // calculating histogram overlap
 {
-	__shared__ double PartialOverlap[Nthreads];
+	double PartialOverlap;
 	int t = threadIdx.x, idx = threadIdx.x + Nthreads * blockIdx.x;
-	PartialOverlap[t] = (idx < R) ? min(1.0,((double)Rinit)/R*exp(-dB*(double)Repd[idx].IE - lnQ)) : 0 ;
-	for (unsigned int stride = Nthreads >> 1; stride > 0; stride >>= 1){
-		__syncthreads();
-		if (t < stride)	PartialOverlap[t] += PartialOverlap[t + stride];
-	}
-	__syncthreads();
-	if(t==0) atomicAdd(overlap,PartialOverlap[0]);
+	PartialOverlap = (idx < R) ? min(1.0,((double)Rinit)/R*exp(-dB*(double)Repd[idx].IE - lnQ)) : 0 ;
+	PartialOverlap = blockReduceSum<double>(PartialOverlap);
+	if(t==0) atomicAdd(overlap,PartialOverlap);
 }
 
 double CalcOverlap(Replica* Rep_d, double dB, int R, double Emean){	// Calculates histogram overlap

@@ -1,5 +1,5 @@
 //
-// PAising version 1.12. This program employs multi-spin coding.
+// PAising version 1.13. This program employs multi-spin coding.
 // This program is introduced in the paper:
 // L.Yu. Barash, M. Weigel, M. Borovsky, W. Janke, L.N. Shchur, GPU accelerated population annealing algorithm
 // This program is licensed under a Creative Commons Attribution 4.0 International License:
@@ -335,7 +335,7 @@ __global__ void QKer(Replica* Rd, int rg, double dB, double Emean, int CalcPart,
 		if(t == 0 )  Rd[idx].parSum.ValDouble[1] = factor; // sum for all threads in current block is saved to global memory
 	} else{					// third part of the calculation, summation of the partial sums
 		double factor; int j, t = threadIdx.x; double MyParSum = 0;
-		for (j=0; j<rg; j+=Nthreads){
+		for (j=0; j*Nthreads < rg; j += Nthreads){
 			factor = (t+j)*Nthreads < rg ? Rd[(t+j)*Nthreads].parSum.ValDouble[1] : 0.0;
 			factor = blockReduceSum<double>(factor); __syncthreads();
 			MyParSum += factor;

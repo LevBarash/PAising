@@ -1,5 +1,5 @@
 //
-// PAising version 1.13. This program employs standard spin coding.
+// PAising version 1.14. This program employs standard spin coding.
 // This program is introduced in the paper:
 // L.Yu. Barash, M. Weigel, M. Borovsky, W. Janke, L.N. Shchur, GPU accelerated population annealing algorithm
 // This program is licensed under a Creative Commons Attribution 4.0 International License:
@@ -106,7 +106,7 @@ template <class sometype> __inline__ __device__ sometype smallblockReduceSum(som
 #if  (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300)
 template <class sometype> __inline__ __device__ sometype warpReduceSum(sometype val)
 {
-	for (int offset = warpSize/2; offset > 0; offset /= 2) val += __shfl_down(val, offset);
+	for (int offset = warpSize/2; offset > 0; offset /= 2) val += __shfl_down_sync(0xFFFFFFFF, val, offset);
 	return val;
 }
 
@@ -797,7 +797,7 @@ int main(int argc, char** argv)
 	CUDAErrChk( cudaUnbindTexture(boltzT) );
 	CUDAErrChk( cudaFree(boltztext));
 
-	CUDAErrChk( cudaThreadSynchronize() );
+	CUDAErrChk( cudaDeviceSynchronize() );
 	CUDAErrChk( cudaEventRecord(stop, 0) );
 	CUDAErrChk( cudaEventSynchronize(stop) );
 	CUDAErrChk( cudaEventElapsedTime(&Etime, start, stop) );

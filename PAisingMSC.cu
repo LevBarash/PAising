@@ -1,5 +1,5 @@
 //
-// PAising version 1.14. This program employs multi-spin coding.
+// PAising version 1.15. This program employs multi-spin coding.
 // This program is introduced in the paper:
 // L.Yu. Barash, M. Weigel, M. Borovsky, W. Janke, L.N. Shchur, GPU accelerated population annealing algorithm
 // This program is licensed under a Creative Commons Attribution 4.0 International License:
@@ -715,7 +715,7 @@ int main(int argc, char** argv)
 
 			dim3 DimGridRes(rg,MSbits,N/2/EQthreads);        // resampleKer configuration with old value of rg
 			rg = (int)ceil(R[i]/(float)MSbits);		// updated number of replica groups
-			Replica* RepNew_d;
+			DimGridR.x = NblocksR = (int)ceil(rg/(float)Nthreads); Replica* RepNew_d;
 			CUDAErrChk( cudaMalloc((void**)&RepNew_d,rg*sizeof(Replica)) );
 			CUDAErrChk( cudaMemset(RepNew_d,0,rg*sizeof(Replica)) );
 			CUDAErrChk( cudaDeviceSynchronize() );

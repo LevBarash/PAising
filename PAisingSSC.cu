@@ -1,5 +1,5 @@
 //
-// PAising version 1.14. This program employs standard spin coding.
+// PAising version 1.15. This program employs standard spin coding.
 // This program is introduced in the paper:
 // L.Yu. Barash, M. Weigel, M. Borovsky, W. Janke, L.N. Shchur, GPU accelerated population annealing algorithm
 // This program is licensed under a Creative Commons Attribution 4.0 International License:

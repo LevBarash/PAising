@@ -1,5 +1,5 @@
 //
-// PAising version 1.15. This program employs multi-spin coding.
+// PAising version 1.16. This program employs multi-spin coding.
 // This program is introduced in the paper:
 // L.Yu. Barash, M. Weigel, M. Borovsky, W. Janke, L.N. Shchur, GPU accelerated population annealing algorithm
 // This program is licensed under a Creative Commons Attribution 4.0 International License:
@@ -353,7 +353,7 @@ __global__ void CalcTauKer(Replica* Rd, int Rinit, int R, int rg, double lnQ, do
 		mu = ((double)Rinit)/R*exp(-dB*(double)Rd[idx].IE[br] - lnQ);
 		mufloor = floor(mu);
 		RNGState localrng; curand_init(rng_seed,initial_sequence+(br+MSbits*idx),0,&localrng);
-		if(curand_uniform(&localrng) < (mu-mufloor))
+		if(curand_uniform_double(&localrng) < (mu-mufloor))
 			Rd[idx].Roff[br] = mufloor + 1;
 		else    Rd[idx].Roff[br] = mufloor;	// number of copies 
 	} else Rd[idx].Roff[br] = 0;
